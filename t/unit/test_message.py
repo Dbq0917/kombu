@@ -13,6 +13,20 @@ class test_Message:
     def test_repr(self):
         assert repr(Message('b', channel=Mock()))
 
+    def test_redelivered(self):
+        assert not Message('b', channel=Mock()).redelivered
+        m = Message(
+            'b', channel=Mock(), delivery_info={'redelivered': True})
+        assert m.redelivered
+
+    def test_delivery_id(self):
+        m = Message('b', channel=Mock(), delivery_tag='tag1')
+        assert m.delivery_id == 'tag1'
+        m = Message(
+            'b', channel=Mock(), delivery_tag='tag1',
+            properties={'message_id': 'id1'})
+        assert m.delivery_id == 'id1'
+
     def test_decode(self):
         m = Message('body', channel=Mock())
         decode = m._decode = Mock()

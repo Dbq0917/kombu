@@ -4340,6 +4340,35 @@ class test_MultiChannelPoller:
         qos.reject(1234, True)
         qos.restore_by_tag.assert_called_with(1234, leftmost=True)
 
+    def test_qos_ack_multiple(self):
+        p, channel = self.create_get()
+        qos = redis.QoS(channel)
+        qos._remove_from_indices = Mock(name='_remove_from_indices')
+        pipe = Mock(name='pipe')
+
+        @contextmanager
+        def mock_pipe_or_acquire(*args, **kwargs):
+            yield pipe
+
+        qos.pipe_or_acquire = mock_pipe_or_acquire
+        tags = ['tag1', 'tag2', 'tag3', 'tag4']
+        for tag in tags:
+            qos._delivered[tag] = Mock(name=tag)
+        qos.ack_multiple('tag2')
+        calls = qos._remove_from_indices.call_args_list
+        assert [c[0][0] for c in calls] == ['tag1', 'tag2']
+        qos._flush()
+        assert list(qos._delivered) == ['tag3', 'tag4']
+        qos._on_collect.cancel()
+
+    def test_qos_ack_multiple_unknown_tag(self):
+        p, channel = self.create_get()
+        qos = redis.QoS(channel)
+        qos._remove_from_indices = Mock(name='_remove_from_indices')
+        qos.ack_multiple('unknown-tag')
+        qos._remove_from_indices.assert_called_with('unknown-tag')
+        qos._on_collect.cancel()
+
     def test_get_brpop_qos_allow(self):
         p, channel = self.create_get(queues=['a_queue'])
         channel.qos.can_consume.return_value = True

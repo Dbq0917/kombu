@@ -108,6 +108,117 @@ class test_QoS:
         self.q._delivered['foo'] = 1
         assert self.q.get('foo') == 1
 
+    def test_ack_multiple(self):
+        tags = [uuid() for _ in range(5)]
+        for i, tag in enumerate(tags):
+            self.q.append(i, tag)
+        self.q.ack_multiple(tags[2])
+        self.q._flush()
+        assert list(self.q._delivered) == tags[3:]
+
+    def test_ack_multiple_all(self):
+        tags = [uuid() for _ in range(3)]
+        for i, tag in enumerate(tags):
+            self.q.append(i, tag)
+        self.q.ack_multiple(tags[-1])
+        self.q._flush()
+        assert not self.q._delivered
+
+    def test_ack_multiple_unknown_tag(self):
+        tag1, tag2 = uuid(), uuid()
+        self.q.append(1, tag1)
+        self.q.append(2, tag2)
+        self.q.ack_multiple('unknown-tag')
+        self.q._flush()
+        assert list(self.q._delivered) == [tag1, tag2]
+
+    def test_adaptive_disabled_by_default(self):
+        assert not self.q.adaptive
+        for _ in range(20):
+            tag = uuid()
+            self.q.append(object(), tag)
+            self.q.ack(tag)
+        assert self.q.prefetch_count == 10
+
+    def test_adaptive_initial_prefetch(self):
+        q = virtual.QoS(client().channel(), adaptive=True, min_prefetch=3)
+        try:
+            assert q.prefetch_count == 3
+        finally:
+            q._on_collect.cancel()
+        q = virtual.QoS(client().channel(), adaptive=True)
+        try:
+            assert q.prefetch_count == 1
+        finally:
+            q._on_collect.cancel()
+
+    def test_adaptive_prefetch_follows_consumption_rate(self, monkeypatch):
+        now = [1000.0]
+        monkeypatch.setattr(
+            'kombu.transport.virtual.base.monotonic', lambda: now[0])
+        q = virtual.QoS(
+            client().channel(), prefetch_count=5, adaptive=True,
+            min_prefetch=1, max_prefetch=100)
+        try:
+            for _ in range(45):
+                tag = uuid()
+                q.append(object(), tag)
+                q.ack(tag)
+                now[0] += 0.05
+            # 20 acks per second -> keeps ~20 messages in flight.
+            assert q.prefetch_count == 20
+        finally:
+            q._on_collect.cancel()
+
+    def test_adaptive_prefetch_respects_max(self, monkeypatch):
+        now = [1000.0]
+        monkeypatch.setattr(
+            'kombu.transport.virtual.base.monotonic', lambda: now[0])
+        q = virtual.QoS(
+            client().channel(), prefetch_count=5, adaptive=True,
+            max_prefetch=10)
+        try:
+            for _ in range(45):
+                tag = uuid()
+                q.append(object(), tag)
+                q.ack(tag)
+                now[0] += 0.05
+            assert q.prefetch_count == 10
+        finally:
+            q._on_collect.cancel()
+
+    def test_adaptive_prefetch_respects_min(self, monkeypatch):
+        now = [1000.0]
+        monkeypatch.setattr(
+            'kombu.transport.virtual.base.monotonic', lambda: now[0])
+        q = virtual.QoS(
+            client().channel(), prefetch_count=5, adaptive=True,
+            min_prefetch=30, max_prefetch=100)
+        try:
+            for _ in range(45):
+                tag = uuid()
+                q.append(object(), tag)
+                q.ack(tag)
+                now[0] += 0.05
+            assert q.prefetch_count == 30
+        finally:
+            q._on_collect.cancel()
+
+    def test_adaptive_prefetch_idle_keeps_value(self, monkeypatch):
+        now = [1000.0]
+        monkeypatch.setattr(
+            'kombu.transport.virtual.base.monotonic', lambda: now[0])
+        q = virtual.QoS(
+            client().channel(), prefetch_count=5, adaptive=True,
+            min_prefetch=1, max_prefetch=100)
+        try:
+            now[0] += 10.0
+            q.append(object(), uuid())
+            # no completions measured: prefetch is left alone.
+            assert q.prefetch_count == 5
+        finally:
+            q._on_collect.cancel()
+
     @pytest.mark.parametrize('compression', [None, 'gzip'])
     def test_restore_unacked_once_dumps_message_body(self, tmp_path, monkeypatch, compression):
         monkeypatch.setattr('tempfile.tempdir', str(tmp_path))
@@ -428,6 +539,101 @@ class test_Channel:
         self.channel._qos = MockQoS(self.channel)
         self.channel.basic_ack('foo')
         assert self.channel._qos.was_acked
+
+    def test_basic_ack__multiple(self):
+
+        class MockQoS(virtual.QoS):
+            acked_multiple = None
+
+            def ack_multiple(self, delivery_tag):
+                self.acked_multiple = delivery_tag
+
+        self.channel._qos = MockQoS(self.channel)
+        self.channel.basic_ack('foo', multiple=True)
+        assert self.channel._qos.acked_multiple == 'foo'
+
+    def test_basic_ack_multiple__pairs_with_prefetch(self):
+        qos = self.channel.qos
+        tags = [uuid() for _ in range(5)]
+        for i, tag in enumerate(tags):
+            qos.append(Mock(name='message{0}'.format(i)), tag)
+        self.channel.basic_ack(tags[2], multiple=True)
+        qos._flush()
+        assert list(qos._delivered) == tags[3:]
+
+    def test_close_restores_unacked_messages(self):
+        # on shutdown, prefetched but unprocessed messages must be
+        # returned to the broker, not left unacknowledged.
+        channel = self.channel
+        restored = []
+        channel._restore = Mock(
+            name='_restore', side_effect=lambda m: restored.append(m))
+        m1, m2 = Mock(name='m1'), Mock(name='m2')
+        channel.qos.append(m1, 'tag1')
+        channel.qos.append(m2, 'tag2')
+        channel.qos.ack('tag1')
+        channel.close()
+        assert restored == [m2]
+        assert channel.qos._delivered.restored
+
+    def test_qos_adaptive_transport_options(self):
+        conn = Connection('memory://', transport_options={
+            'adaptive_prefetch': True,
+            'min_prefetch': 2,
+            'max_prefetch': 42,
+        })
+        try:
+            channel = conn.channel()
+            qos = channel.qos
+            assert qos.adaptive
+            assert qos.min_prefetch == 2
+            assert qos.max_prefetch == 42
+            assert qos.prefetch_count == 2
+        finally:
+            conn.close()
+
+    def test_basic_publish_stamps_message_id(self,
+                                             n='test_publish_message_id'):
+        c = memory_client().channel()
+        c.queue_declare(n)
+        m = c.prepare_message('the quick brown fox...')
+        c.basic_publish(m, '', n)
+        r = c.message_to_python(c.basic_get(n))
+        assert r.properties['message_id']
+        assert r.delivery_id == r.properties['message_id']
+
+    def test_basic_publish_keeps_existing_message_id(self,
+                                                     n='test_keep_msg_id'):
+        c = memory_client().channel()
+        c.queue_declare(n)
+        m = c.prepare_message('the quick brown fox...')
+        m['properties']['message_id'] = 'custom-id'
+        c.basic_publish(m, '', n)
+        r = c.message_to_python(c.basic_get(n))
+        assert r.delivery_id == 'custom-id'
+
+    def test_restore_marks_message_redelivered(self,
+                                               n='test_restore_redelivered'):
+        c = memory_client().channel()
+        c.exchange_declare(n)
+        c.queue_declare(n)
+        c.queue_bind(n, n, n)
+        m = c.prepare_message('the quick brown fox...')
+        c.basic_publish(m, n, n)
+
+        r1 = c.message_to_python(c.basic_get(n))
+        assert not r1.redelivered
+        message_id = r1.delivery_id
+        assert message_id
+
+        c._restore(r1)
+        r2 = c.message_to_python(c.basic_get(n))
+        assert r2.redelivered
+        assert r2.delivery_info['redelivered']
+        assert r2.headers['redelivered']
+        # the delivery identity survives redelivery: duplicates can be
+        # recognized by it.
+        assert r2.delivery_id == message_id
 
     def test_basic_recover__requeue(self):
 

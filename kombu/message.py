@@ -211,6 +211,27 @@ class Message:
         return self._state in ACK_STATES
 
     @property
+    def redelivered(self):
+        """Set to true if the message was redelivered by the broker.
+
+        A redelivered message is a copy of a message that was already
+        delivered before (e.g. because the previous consumer did not
+        acknowledge it), so the consumer may have seen it already.
+        """
+        return self.delivery_info.get('redelivered', False)
+
+    @property
+    def delivery_id(self):
+        """Identifier that is stable across redeliveries of a message.
+
+        This is the AMQP ``message_id`` property when set (virtual
+        transports stamp one automatically at publish time), falling
+        back to the delivery tag.  Consumers can use it to recognize
+        and deduplicate redelivered copies of the same message.
+        """
+        return self.properties.get('message_id') or self.delivery_tag
+
+    @property
     def payload(self):
         """The decoded message body."""
         return self._decoded_cache if self._decoded_cache else self.decode()

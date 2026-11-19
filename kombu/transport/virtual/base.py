@@ -9,7 +9,7 @@ import base64
 import socket
 import warnings
 from array import array
-from collections import OrderedDict, defaultdict, namedtuple
+from collections import OrderedDict, defaultdict, deque, namedtuple
 from itertools import count
 from multiprocessing.util import Finalize
 from queue import Empty
@@ -161,10 +161,37 @@ class QoS:
     ---------
         channel (ChannelT): Connection channel.
         prefetch_count (int): Initial prefetch count (defaults to 0).
+
+    Keyword Arguments:
+    -----------------
+        adaptive (bool): Enable adaptive prefetching, adjusting
+            ``prefetch_count`` to the measured consumption (ack) rate
+            instead of using a fixed value (defaults to disabled).
+        min_prefetch (int): Lower bound for the adaptive prefetch count.
+        max_prefetch (int): Upper bound for the adaptive prefetch count.
     """
 
     #: current prefetch count value
     prefetch_count = 0
+
+    #: If enabled, the prefetch count is adjusted automatically
+    #: based on the measured consumption rate, so that the number of
+    #: prefetched (in-flight) messages tracks how fast the consumer
+    #: is actually acknowledging them.
+    adaptive = False
+
+    #: Lower bound for the adaptive prefetch count (None means no limit).
+    min_prefetch = None
+
+    #: Upper bound for the adaptive prefetch count (None means no limit).
+    max_prefetch = None
+
+    #: Seconds worth of in-flight work the adaptive controller
+    #: tries to keep prefetched.
+    adaptive_target_window = 1.0
+
+    #: Minimum number of seconds between adaptive prefetch adjustments.
+    adaptive_adjust_interval = 1.0
 
     #: :class:`~collections.OrderedDict` of active messages.
     #: *NOTE*: Can only be modified by the consuming thread.
@@ -179,9 +206,19 @@ class QoS:
     #: If disabled, unacked messages won't be restored at shutdown.
     restore_at_shutdown = True
 
-    def __init__(self, channel, prefetch_count=0):
+    def __init__(self, channel, prefetch_count=0, adaptive=False,
+                 min_prefetch=None, max_prefetch=None):
         self.channel = channel
         self.prefetch_count = prefetch_count or 0
+        self.adaptive = adaptive
+        self.min_prefetch = min_prefetch
+        self.max_prefetch = max_prefetch
+        #: monotonic timestamps of recently completed (acked/rejected)
+        #: deliveries, used to measure the consumption rate.
+        self._completed_at = deque()
+        self._last_prefetch_adjust = monotonic()
+        if self.adaptive and not self.prefetch_count:
+            self.prefetch_count = min_prefetch or 1
 
         # Standard Python dictionaries do not support setting attributes
         # on the object, hence the use of OrderedDict
@@ -223,10 +260,49 @@ class QoS:
         """Append message to transactional state."""
         if self._dirty:
             self._flush()
+        self._maybe_adjust_prefetch()
         self._quick_append(delivery_tag, message)
 
     def get(self, delivery_tag):
         return self._delivered[delivery_tag]
+
+    def _record_completion(self):
+        if self.adaptive:
+            self._completed_at.append(monotonic())
+
+    def _maybe_adjust_prefetch(self):
+        """Adjust prefetch count to the measured consumption rate.
+
+        Called on the consuming thread from :meth:`append`; does nothing
+        unless :attr:`adaptive` is enabled and enough time has passed
+        since the last adjustment.
+        """
+        if not self.adaptive:
+            return
+        now = monotonic()
+        if now - self._last_prefetch_adjust < self.adaptive_adjust_interval:
+            return
+        self._last_prefetch_adjust = now
+        window = self.adaptive_target_window
+        cutoff = now - window
+        completed = self._completed_at
+        while completed and completed[0] < cutoff:
+            completed.popleft()
+        if len(completed) < 2:
+            # not enough samples to measure a rate: keep current value.
+            return
+        span = max(completed[-1] - completed[0], 1e-9)
+        rate = (len(completed) - 1) / span
+        target = max(int(round(rate * window)), 1)
+        if self.min_prefetch is not None:
+            target = max(target, self.min_prefetch)
+        if self.max_prefetch is not None:
+            target = min(target, self.max_prefetch)
+        if target != self.prefetch_count:
+            logger.debug(
+                'QoS: adaptive prefetch %r -> %r (rate: %.2f msg/s)',
+                self.prefetch_count, target, rate)
+            self.prefetch_count = target
 
     def _flush(self):
         """Flush dirty (acked/rejected) tags from."""
@@ -241,12 +317,34 @@ class QoS:
 
     def ack(self, delivery_tag):
         """Acknowledge message and remove from transactional state."""
+        self._record_completion()
         self._quick_ack(delivery_tag)
+
+    def ack_multiple(self, delivery_tag):
+        """Acknowledge all messages up to and including ``delivery_tag``.
+
+        This is the cumulative (AMQP ``multiple=True``) form of
+        :meth:`ack`, allowing a batch of prefetched messages to be
+        acknowledged with a single call.
+        """
+        self._flush()
+        delivered = self._delivered
+        if delivery_tag not in delivered:
+            return self.ack(delivery_tag)
+        count = 0
+        for tag in delivered:
+            self._quick_ack(tag)
+            count += 1
+            if tag == delivery_tag:
+                break
+        if self.adaptive:
+            self._completed_at.extend([monotonic()] * count)
 
     def reject(self, delivery_tag, requeue=False):
         """Remove from transactional state and requeue message."""
         if requeue:
             self.channel._restore_at_beginning(self._delivered[delivery_tag])
+        self._record_completion()
         self._quick_ack(delivery_tag)
 
     def restore_unacked(self):
@@ -467,8 +565,24 @@ class Channel(AbstractChannel, base.StdChannel):
     #: Set by ``transport_options['deadletter_queue']``.
     deadletter_queue = None
 
+    #: Enable adaptive prefetching: the prefetch count follows the
+    #: measured consumption rate instead of staying at a fixed value.
+    #: Set by ``transport_options['adaptive_prefetch']``.
+    adaptive_prefetch = False
+
+    #: Lower bound for the adaptive prefetch count.
+    #: Set by ``transport_options['min_prefetch']``.
+    min_prefetch = None
+
+    #: Upper bound for the adaptive prefetch count.
+    #: Set by ``transport_options['max_prefetch']``.
+    max_prefetch = None
+
     # List of options to transfer from :attr:`transport_options`.
-    from_transport_options = ('body_encoding', 'deadletter_queue')
+    from_transport_options = (
+        'body_encoding', 'deadletter_queue',
+        'adaptive_prefetch', 'min_prefetch', 'max_prefetch',
+    )
 
     # Priority defaults
     default_priority = 0
@@ -632,6 +746,9 @@ class Channel(AbstractChannel, base.StdChannel):
             body_encoding=body_encoding,
             delivery_tag=self._next_delivery_tag(),
         )
+        # stamp a stable message id so that redelivered copies of this
+        # message can be recognized (and deduplicated) by the consumer.
+        props.setdefault('message_id', uuid())
         props['delivery_info'].update(
             exchange=exchange,
             routing_key=routing_key,
@@ -677,7 +794,10 @@ class Channel(AbstractChannel, base.StdChannel):
 
     def basic_ack(self, delivery_tag, multiple=False):
         """Acknowledge message."""
-        self.qos.ack(delivery_tag)
+        if multiple:
+            self.qos.ack_multiple(delivery_tag)
+        else:
+            self.qos.ack(delivery_tag)
 
     def basic_recover(self, requeue=False):
         """Recover unacked messages."""
@@ -748,6 +868,11 @@ class Channel(AbstractChannel, base.StdChannel):
         delivery_info = message.delivery_info
         message = message.serializable()
         message['redelivered'] = True
+        # mark the message as redelivered where the consumer can see it,
+        # so that duplicates can be recognized by their delivery identity.
+        message['headers']['redelivered'] = True
+        message['properties'].setdefault(
+            'delivery_info', {})['redelivered'] = True
         for queue in self._lookup(
             delivery_info['exchange'],
                 delivery_info['routing_key']):
@@ -845,7 +970,12 @@ class Channel(AbstractChannel, base.StdChannel):
     def qos(self):
         """:class:`QoS` manager for this channel."""
         if self._qos is None:
-            self._qos = self.QoS(self)
+            self._qos = self.QoS(
+                self,
+                adaptive=self.adaptive_prefetch,
+                min_prefetch=self.min_prefetch,
+                max_prefetch=self.max_prefetch,
+            )
         return self._qos
 
     @property
