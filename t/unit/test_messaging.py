@@ -12,9 +12,11 @@ from amqp.exceptions import RecoverableConnectionError
 
 from kombu import Connection, Consumer, Exchange, Producer, Queue
 from kombu.exceptions import MessageStateError, OperationalError
+from kombu.message import Message
 from kombu.transport import memory, virtual
 from kombu.utils import json
 from kombu.utils.functional import ChannelPromise
+from kombu.utils.uuid import uuid
 from t.mocks import Transport
 
 
@@ -204,6 +206,24 @@ class test_Producer:
         p.publish('hello', exchange=Exchange('foo'), expiration=10)
         properties = p._channel.prepare_message.call_args[0][5]
         assert properties['expiration'] == '10000'
+
+    def test_publish_stamps_message_id(self):
+        p = self.connection.Producer()
+        p.channel = Mock()
+        p.channel.connection.client.declared_entities = set()
+        p.publish('hello', exchange=Exchange('foo'))
+        properties = p._channel.prepare_message.call_args[0][5]
+        assert properties['message_id']
+
+    def test_publish_keeps_existing_message_id(self):
+        p = self.connection.Producer()
+        p.channel = Mock()
+        p.channel.connection.client.declared_entities = set()
+        p.publish(
+            'hello', exchange=Exchange('foo'), message_id='custom-id',
+        )
+        properties = p._channel.prepare_message.call_args[0][5]
+        assert properties['message_id'] == 'custom-id'
 
     def test_publish_with_timeout(self):
         p = self.connection.Producer()
@@ -1227,6 +1247,132 @@ class test_Consumer:
         assert 'basic_ack' in channel
         assert 'message_to_python' in channel
         assert received[0] == {'foo': 'bar'}
+
+    def test_ack_on_receive_acks_before_callback(self):
+        received = []
+
+        def callback(body, message):
+            received.append(message.acknowledged)
+
+        with Connection('memory://') as connection:
+            queue = Queue(uuid())
+            with connection.Consumer(
+                queues=[queue],
+                callbacks=[callback],
+                ack_on_receive=True,
+            ):
+                connection.Producer().publish(
+                    {'order': 1}, routing_key=queue.name,
+                )
+                connection.drain_events(timeout=1)
+
+        assert received == [True]
+
+    def test_ack_on_receive_defaults_to_single_prefetch(self):
+        channel = self.connection.channel()
+        queue = Queue('qname1', self.exchange, 'rkey')
+        consumer = Consumer(channel, [queue], ack_on_receive=True)
+        assert consumer.prefetch_count == 1
+        assert 'basic_qos' in channel
+
+    def test_ack_on_receive_keeps_explicit_prefetch(self):
+        channel = self.connection.channel()
+        queue = Queue('qname1', self.exchange, 'rkey')
+        consumer = Consumer(
+            channel, [queue], ack_on_receive=True, prefetch_count=1000,
+        )
+        assert consumer.prefetch_count == 1000
+
+    def test_ack_on_receive_failure_does_not_call_callback(self):
+        channel = self.connection.channel()
+        queue = Queue('qname1', self.exchange, 'rkey')
+        callback = Mock(name='callback')
+        channel.basic_ack = Mock(
+            name='basic_ack',
+            side_effect=OperationalError('ack failed'),
+        )
+        consumer = Consumer(
+            channel, [queue], callbacks=[callback], ack_on_receive=True,
+        )
+
+        with pytest.raises(OperationalError):
+            consumer._receive_callback({'foo': 'bar'})
+
+        callback.assert_not_called()
+
+    def test_ack_on_receive_deduplicates_redelivered_message(self):
+        received = []
+
+        def callback(body, message):
+            received.append(body)
+
+        with Connection('memory://') as connection:
+            queue = Queue(uuid())
+            with connection.Consumer(
+                queues=[queue],
+                callbacks=[callback],
+                ack_on_receive=True,
+            ):
+                producer = connection.Producer()
+                producer.publish(
+                    {'order': 1}, routing_key=queue.name,
+                    message_id='same-message',
+                )
+                producer.publish(
+                    {'order': 2}, routing_key=queue.name,
+                    message_id='same-message',
+                )
+                connection.drain_events(timeout=1)
+                connection.drain_events(timeout=1)
+
+        assert received == [{'order': 1}]
+
+    def test_processing_failure_republishes_once(self):
+        attempts = []
+        completed = []
+
+        def callback(body, message):
+            attempts.append(body['order'])
+            if len(attempts) == 1:
+                raise RuntimeError('downstream unavailable')
+            completed.append(body['order'])
+
+        with Connection('memory://') as connection:
+            queue = Queue(uuid())
+            with connection.Consumer(
+                queues=[queue],
+                callbacks=[callback],
+                ack_on_receive=True,
+            ):
+                connection.Producer().publish(
+                    {'order': 1}, routing_key=queue.name,
+                )
+                connection.drain_events(timeout=1)
+                connection.drain_events(timeout=1)
+
+        assert attempts == [1, 1]
+        assert completed == [1]
+
+    def test_compensation_preserves_expiration(self):
+        message = Message(
+            'body',
+            channel=Mock(),
+            delivery_tag='tag1',
+            delivery_info={'exchange': 'ex', 'routing_key': 'rk'},
+            properties={
+                'expiration': '10000',
+                'message_id': 'message-id',
+            },
+        )
+        consumer = Consumer(None, callbacks=[], ack_on_receive=True)
+        consumer.channel = message.channel
+
+        with patch('kombu.messaging.Producer') as producer:
+            consumer._compensate(message, RuntimeError('failed'))
+
+        assert producer.return_value.publish.call_args.kwargs[
+            'expiration'
+        ] == 10.0
 
     def test_basic_ack_twice(self):
         channel = self.connection.channel()

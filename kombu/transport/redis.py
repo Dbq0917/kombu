@@ -562,6 +562,18 @@ class QoS(virtual.QoS):
         self._remove_from_indices(delivery_tag).execute()
         super().ack(delivery_tag)
 
+    def ack_multiple(self, delivery_tag):
+        self._flush()
+        if delivery_tag not in self._delivered:
+            return self.ack(delivery_tag)
+        with self.pipe_or_acquire() as pipe:
+            for tag in self._delivered:
+                self._remove_from_indices(tag, pipe)
+                if tag == delivery_tag:
+                    break
+            pipe.execute()
+        super().ack_multiple(delivery_tag)
+
     def reject(self, delivery_tag, requeue=False):
         if requeue:
             self.restore_by_tag(delivery_tag, leftmost=True)

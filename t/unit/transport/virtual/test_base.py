@@ -108,6 +108,30 @@ class test_QoS:
         self.q._delivered['foo'] = 1
         assert self.q.get('foo') == 1
 
+    def test_ack_multiple(self):
+        tags = [uuid() for _ in range(5)]
+        for i, tag in enumerate(tags):
+            self.q.append(i, tag)
+        self.q.ack_multiple(tags[2])
+        self.q._flush()
+        assert list(self.q._delivered) == tags[3:]
+
+    def test_ack_multiple_all(self):
+        tags = [uuid() for _ in range(3)]
+        for i, tag in enumerate(tags):
+            self.q.append(i, tag)
+        self.q.ack_multiple(tags[-1])
+        self.q._flush()
+        assert not self.q._delivered
+
+    def test_ack_multiple_unknown_tag(self):
+        tag1, tag2 = uuid(), uuid()
+        self.q.append(1, tag1)
+        self.q.append(2, tag2)
+        self.q.ack_multiple('unknown-tag')
+        self.q._flush()
+        assert list(self.q._delivered) == [tag1, tag2]
+
     @pytest.mark.parametrize('compression', [None, 'gzip'])
     def test_restore_unacked_once_dumps_message_body(self, tmp_path, monkeypatch, compression):
         monkeypatch.setattr('tempfile.tempdir', str(tmp_path))
@@ -428,6 +452,35 @@ class test_Channel:
         self.channel._qos = MockQoS(self.channel)
         self.channel.basic_ack('foo')
         assert self.channel._qos.was_acked
+
+    def test_basic_ack_multiple(self):
+        tags = [uuid() for _ in range(5)]
+        for i, tag in enumerate(tags):
+            self.channel.qos.append(Mock(name=f'message{i}'), tag)
+        self.channel.basic_ack(tags[2], multiple=True)
+        self.channel.qos._flush()
+        assert list(self.channel.qos._delivered) == tags[3:]
+
+    def test_restore_marks_message_redelivered(self,
+                                               n='test_restore_redelivered'):
+        c = memory_client().channel()
+        c.exchange_declare(n)
+        c.queue_declare(n)
+        c.queue_bind(n, n, n)
+        m = c.prepare_message('the quick brown fox...')
+        c.basic_publish(m, n, n)
+
+        r1 = c.message_to_python(c.basic_get(n))
+        assert not r1.redelivered
+        assert r1.delivery_id
+        delivery_id = r1.delivery_id
+
+        c._restore(r1)
+        r2 = c.message_to_python(c.basic_get(n))
+        assert r2.redelivered
+        assert r2.delivery_info['redelivered']
+        assert r2.headers['redelivered']
+        assert r2.delivery_id == delivery_id
 
     def test_basic_recover__requeue(self):
 

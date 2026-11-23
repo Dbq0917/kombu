@@ -243,6 +243,17 @@ class QoS:
         """Acknowledge message and remove from transactional state."""
         self._quick_ack(delivery_tag)
 
+    def ack_multiple(self, delivery_tag):
+        """Acknowledge all messages up to and including ``delivery_tag``."""
+        self._flush()
+        delivered = self._delivered
+        if delivery_tag not in delivered:
+            return
+        for tag in delivered:
+            self._quick_ack(tag)
+            if tag == delivery_tag:
+                break
+
     def reject(self, delivery_tag, requeue=False):
         """Remove from transactional state and requeue message."""
         if requeue:
@@ -677,7 +688,10 @@ class Channel(AbstractChannel, base.StdChannel):
 
     def basic_ack(self, delivery_tag, multiple=False):
         """Acknowledge message."""
-        self.qos.ack(delivery_tag)
+        if multiple:
+            self.qos.ack_multiple(delivery_tag)
+        else:
+            self.qos.ack(delivery_tag)
 
     def basic_recover(self, requeue=False):
         """Recover unacked messages."""
@@ -748,6 +762,9 @@ class Channel(AbstractChannel, base.StdChannel):
         delivery_info = message.delivery_info
         message = message.serializable()
         message['redelivered'] = True
+        message.setdefault('headers', {})['redelivered'] = True
+        message['properties'].setdefault(
+            'delivery_info', {})['redelivered'] = True
         for queue in self._lookup(
             delivery_info['exchange'],
                 delivery_info['routing_key']):
@@ -776,6 +793,7 @@ class Channel(AbstractChannel, base.StdChannel):
         properties = properties or {}
         properties.setdefault('delivery_info', {})
         properties.setdefault('priority', priority or self.default_priority)
+        properties.setdefault('message_id', uuid())
 
         return {'body': body,
                 'content-encoding': content_encoding,

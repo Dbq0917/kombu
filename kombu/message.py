@@ -211,6 +211,26 @@ class Message:
         return self._state in ACK_STATES
 
     @property
+    def redelivered(self):
+        """Return true if the broker redelivered this message."""
+        return self.delivery_info.get('redelivered', False)
+
+    @property
+    def delivery_id(self):
+        """Return an identifier that is stable across redeliveries.
+
+        Publishers should set the AMQP ``message_id`` property (Kombu
+        producers do this automatically).  The delivery tag is only a
+        fallback because some transports assign a new one to every
+        redelivery.
+        """
+        message_id = self.properties.get('message_id')
+        if message_id:
+            return message_id
+        delivery_info = self.delivery_info.get('gcpubsub_message') or {}
+        return delivery_info.get('message_id') or self.delivery_tag
+
+    @property
     def payload(self):
         """The decoded message body."""
         return self._decoded_cache if self._decoded_cache else self.decode()

@@ -11,8 +11,10 @@ from .compression import compress
 from .connection import PooledConnection, is_connection, maybe_channel
 from .entity import Exchange, Queue, maybe_delivery_mode
 from .exceptions import ContentDisallowed
+from .log import get_logger
 from .serialization import dumps, prepare_accept_content
-from .utils.functional import ChannelPromise, maybe_list
+from .utils.functional import ChannelPromise, LRUCache, maybe_list
+from .utils.uuid import uuid
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -20,6 +22,9 @@ if TYPE_CHECKING:
 __all__ = ('Exchange', 'Queue', 'Producer', 'Consumer')
 
 DEFAULT_BATCH_SIZE = 1000
+DEFAULT_DEDUP_SIZE = 10000
+
+logger = get_logger(__name__)
 
 
 class _ProducerBatchState:
@@ -344,6 +349,8 @@ class Producer:
         exchange_name, properties['delivery_mode'] = self._delivery_details(
             exchange or self.exchange, delivery_mode,
         )
+        if not properties.get('message_id'):
+            properties['message_id'] = uuid()
 
         if expiration is not None:
             properties['expiration'] = str(int(expiration * 1000))
@@ -497,6 +504,10 @@ class Consumer:
         on_message (Callable): See :attr:`on_message`
         on_decode_error (Callable): see :attr:`on_decode_error`.
         prefetch_count (int): see :attr:`prefetch_count`.
+        ack_on_receive (bool): see :attr:`ack_on_receive`.
+        on_processing_error (Callable): see :attr:`on_processing_error`.
+        deduplicate (bool): see :attr:`deduplicate`.
+        dedup_max_size (int): see :attr:`dedup_max_size`.
     """
 
     ContentDisallowed = ContentDisallowed
@@ -552,6 +563,31 @@ class Consumer:
     #: that occurred while trying to decode it.
     on_decode_error = None
 
+    #: Acknowledge a message before invoking the callbacks.
+    #:
+    #: This prevents a slow callback from holding the broker
+    #: acknowledgement past its visibility timeout.  Failures are handed
+    #: to :attr:`on_processing_error`, which by default republishes the
+    #: message to its original destination.
+    ack_on_receive = False
+
+    #: Callback invoked as ``(message, exc)`` when a callback raises.
+    #:
+    #: If unset and :attr:`ack_on_receive` is enabled, the message is
+    #: re-published to its original exchange and routing key so that a
+    #: processing failure cannot lose it.
+    on_processing_error = None
+
+    #: Skip callbacks for a message whose :attr:`~kombu.Message.delivery_id`
+    #: was already processed successfully.
+    #:
+    #: Enabled by default when :attr:`ack_on_receive` is enabled.  The
+    #: cache is per consumer and bounded by :attr:`dedup_max_size`.
+    deduplicate = None
+
+    #: Maximum number of delivery ids to remember for deduplication.
+    dedup_max_size = DEFAULT_DEDUP_SIZE
+
     #: List of accepted content-types.
     #:
     #: An exception will be raised if the consumer receives
@@ -574,7 +610,9 @@ class Consumer:
 
     def __init__(self, channel, queues=None, no_ack=None, auto_declare=None,
                  callbacks=None, on_decode_error=None, on_message=None,
-                 accept=None, prefetch_count=None, tag_prefix=None):
+                 accept=None, prefetch_count=None, tag_prefix=None,
+                 ack_on_receive=None, on_processing_error=None,
+                 deduplicate=None, dedup_max_size=None):
         self.channel = channel
         self.queues = maybe_list(queues or [])
         self.no_ack = self.no_ack if no_ack is None else no_ack
@@ -589,7 +627,24 @@ class Consumer:
         if on_decode_error is not None:
             self.on_decode_error = on_decode_error
         self.accept = prepare_accept_content(accept)
-        self.prefetch_count = prefetch_count
+        if ack_on_receive is not None:
+            self.ack_on_receive = ack_on_receive
+        if prefetch_count is not None:
+            self.prefetch_count = prefetch_count
+        elif self.ack_on_receive and self.prefetch_count is None:
+            # With more than one prefetched message, the ones behind a
+            # slow callback are still unacknowledged and can time out.
+            self.prefetch_count = 1
+        if on_processing_error is not None:
+            self.on_processing_error = on_processing_error
+        if deduplicate is None:
+            deduplicate = self.ack_on_receive
+        self.deduplicate = deduplicate
+        if dedup_max_size is not None:
+            self.dedup_max_size = dedup_max_size
+        self._processed = (
+            LRUCache(limit=self.dedup_max_size) if self.deduplicate else None
+        )
 
         if self.channel:
             self.revive(self.channel)
@@ -850,6 +905,62 @@ class Consumer:
             raise NotImplementedError('Consumer does not have any callbacks')
         [callback(body, message) for callback in callbacks]
 
+    def _ack_before_processing(self, message):
+        message.ack()
+
+    def _is_duplicate(self, message):
+        if not self.deduplicate or message.delivery_id is None:
+            return False
+        return message.delivery_id in self._processed
+
+    def _mark_processed(self, message):
+        if self.deduplicate and message.delivery_id is not None:
+            self._processed[message.delivery_id] = True
+
+    def _compensate(self, message, exc):
+        delivery_info = message.delivery_info
+        exchange = delivery_info.get('exchange', '')
+        routing_key = delivery_info.get('routing_key', '')
+        headers = dict(message.headers)
+        retry_count = int(headers.get('x-kombu-retry-count', 0)) + 1
+        headers['x-kombu-retry-count'] = retry_count
+        headers['x-kombu-original-message-id'] = message.delivery_id
+
+        properties = dict(message.properties)
+        properties.pop('delivery_tag', None)
+        properties.pop('delivery_info', None)
+        properties.pop('redelivered', None)
+        expiration = properties.pop('expiration', None)
+        if not properties.get('message_id') and message.delivery_id is not None:
+            properties['message_id'] = message.delivery_id
+
+        logger.warning(
+            'Processing message %r failed, republishing to %r/%r '
+            '(attempt %d): %r',
+            message.delivery_id, exchange, routing_key, retry_count, exc,
+        )
+        return Producer(self.channel).publish(
+            message.body,
+            exchange=exchange,
+            routing_key=routing_key,
+            content_type=message.content_type,
+            content_encoding=message.content_encoding,
+            headers=headers,
+            retry=True,
+            expiration=(
+                int(expiration) / 1000.0 if expiration is not None else None
+            ),
+            **properties,
+        )
+
+    def _process_error(self, message, exc):
+        handler = self.on_processing_error
+        if handler is None and self.ack_on_receive:
+            handler = self._compensate
+        if handler is None:
+            raise exc
+        return handler(message, exc)
+
     def _basic_consume(self, queue, consumer_tag=None,
                        no_ack=no_ack, nowait=True):
         tag = self._active_tags.get(queue.name)
@@ -884,7 +995,21 @@ class Consumer:
                 raise
             self.on_decode_error(message, exc)
         else:
-            return on_m(message) if on_m else self.receive(decoded, message)
+            if self.ack_on_receive:
+                if self._is_duplicate(message):
+                    if not message.acknowledged:
+                        self._ack_before_processing(message)
+                    return None
+                self._ack_before_processing(message)
+            try:
+                result = on_m(message) if on_m else self.receive(
+                    decoded, message,
+                )
+            except Exception as exc:
+                return self._process_error(message, exc)
+            else:
+                self._mark_processed(message)
+                return result
 
     def __repr__(self):
         return f'<{type(self).__name__}: {self.queues}>'

@@ -54,6 +54,53 @@ acknowledgement is set.
 
     >>> consumer.register_callback(callback)
 
+Acknowledging on receipt
+------------------------
+
+By default the callback must call ``message.ack()``.  If processing can
+take longer than the broker's acknowledgement timeout, use
+``ack_on_receive=True`` so the message is acknowledged before callbacks
+run:
+
+.. code-block:: python
+
+    >>> consumer = Consumer(
+    ...     connection, [queue],
+    ...     callbacks=[callback],
+    ...     ack_on_receive=True,
+    ... )
+
+When ``prefetch_count`` is not given, this mode uses a prefetch count of
+one so that messages behind a slow callback are not left unacknowledged
+where a broker visibility timeout can redeliver them.  Set
+``prefetch_count`` explicitly when higher concurrency is required.  The
+early acknowledgement is sent per message, which bounds the effect of an
+acknowledgement failure to one delivery instead of replaying a large
+batch.
+
+The callback must not call ``message.ack()`` in this mode.  If it raises,
+Kombu republishes the original message to its exchange and routing key and
+records the retry in the ``x-kombu-retry-count`` header.  A custom
+``on_processing_error(message, exc)`` callback can perform a different
+compensation, for example publishing to a retry queue.
+
+``ack_on_receive`` also enables a bounded in-process deduplication cache.
+Redelivered copies with the same
+:attr:`~kombu.Message.delivery_id` are acknowledged but do not run the
+callback again.  Kombu producers assign ``message_id`` automatically, and
+AMQP brokers preserve it across redeliveries.  Applications should use this
+identifier as the downstream idempotency key as well: an acknowledgement
+can be lost after processing, and no client library can make an external
+side effect exactly-once on its own.
+
+For cumulative AMQP-style acknowledgements, pass ``multiple=True`` to
+``message.ack()``.  Virtual and Redis transports support this and remove
+all earlier deliveries on the channel up to and including the supplied
+delivery tag.  If a batch acknowledgement fails, those deliveries can be
+redelivered; the delivery-id cache prevents already completed callbacks
+from producing duplicate side effects, while failed messages remain
+eligible for processing.
+
 Draining events from a single consumer
 --------------------------------------
 
