@@ -95,8 +95,8 @@ import os
 import re
 import shutil
 import tempfile
-import uuid
 from collections import namedtuple
+from itertools import count
 from pathlib import Path
 from queue import Empty
 from time import monotonic
@@ -108,6 +108,10 @@ from kombu.utils.json import dumps, loads
 from kombu.utils.objects import cached_property
 
 VERSION = (1, 0, 0)
+
+#: Monotonic sequence number ensuring files written within the same
+#: millisecond still sort in publish order, so each queue stays FIFO.
+_put_counter = count(1)
 __version__ = '.'.join(map(str, VERSION))
 
 # needs win32all to work on Windows
@@ -261,8 +265,9 @@ class Channel(virtual.Channel):
 
     def _put(self, queue, payload, **kwargs):
         """Put `message` onto `queue`."""
-        filename = '{}_{}.{}.msg'.format(int(round(monotonic() * 1000)),
-                                         uuid.uuid4(), queue)
+        filename = '{}_{:012d}.{}.msg'.format(
+            int(round(monotonic() * 1000)),
+            next(_put_counter), queue)
         filename = os.path.join(self.data_folder_out, filename)
 
         f = None

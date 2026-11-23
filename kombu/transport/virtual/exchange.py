@@ -6,6 +6,7 @@ by the AMQ protocol  (excluding the `headers` exchange).
 
 from __future__ import annotations
 
+import hashlib
 import re
 
 from kombu.utils.text import escape_regex
@@ -156,9 +157,56 @@ class FanoutExchange(ExchangeType):
                 exchange, message, routing_key, **kwargs)
 
 
+class ConsistentHashExchange(ExchangeType):
+    """Consistent-hash (key-partitioned) exchange.
+
+    The ``consistent-hash`` exchange guarantees that every message
+    carrying the same routing key is routed to exactly one of the queues
+    bound to the exchange.  Because the selected queue never changes for
+    a given key, messages belonging to the same entity (for example the
+    status updates of a single order) are always consumed from a single
+    queue and therefore stay in publish order, while different keys can
+    still be consumed in parallel from the other queues.
+
+    The destination queue is chosen by hashing the routing key with
+    :func:`hashlib.md5` and taking the result modulo the number of bound
+    queues.  ``md5`` is used purely as a stable, well distributed
+    partitioning function; the same hash is produced by every process so
+    independent worker processes agree on the destination queue.
+    """
+
+    type = 'consistent-hash'
+
+    def _queues(self, table):
+        # Sort and de-duplicate the bound queues so that processes that
+        # observed bindings in a different order still make the same
+        # routing decision.
+        return sorted({queue for _, _, queue in table if queue})
+
+    def _route(self, routing_key, queues):
+        key_hash = int(
+            hashlib.md5(routing_key.encode('utf-8')).hexdigest(), 16
+        )
+        return queues[key_hash % len(queues)]
+
+    def lookup(self, table, exchange, routing_key, default):
+        queues = self._queues(table)
+        if not queues:
+            return {default} if default is not None else set()
+        return {self._route(routing_key, queues)}
+
+    def deliver(self, message, exchange, routing_key, **kwargs):
+        _lookup = self.channel._lookup
+        _put = self.channel._put
+        for queue in _lookup(exchange, routing_key):
+            if queue:
+                _put(queue, message, **kwargs)
+
+
 #: Map of standard exchange types and corresponding classes.
 STANDARD_EXCHANGE_TYPES = {
     'direct': DirectExchange,
     'topic': TopicExchange,
     'fanout': FanoutExchange,
+    'consistent-hash': ConsistentHashExchange,
 }

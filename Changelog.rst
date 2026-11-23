@@ -5,6 +5,21 @@
 ================
 
 
+.. _version-5.7.1:
+
+5.7.1
+=====
+:release-date: TBA
+
+
+What's Changed
+~~~~~~~~~~~~~~
+- Add a ``consistent-hash`` virtual exchange type that routes every
+  message with the same routing key to one fixed bound queue, enabling
+  ordered, per-key consumption across multiple consumer processes while
+  preserving concurrent consumption between different keys.
+
+
 .. _version-5.7.0:
 
 5.7.0

@@ -30,6 +30,13 @@
         :members:
         :undoc-members:
 
+    Consistent Hash
+    ---------------
+
+    .. autoclass:: ConsistentHashExchange
+        :members:
+        :undoc-members:
+
     Interface
     ---------
 

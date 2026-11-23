@@ -63,6 +63,57 @@ class test_Fanout(ExchangeCase):
         self.e.channel._put_fanout.assert_not_called()
 
 
+class test_ConsistentHash(ExchangeCase):
+    type = exchange.ConsistentHashExchange
+    table = [('rFoo', None, 'qFoo'),
+             ('rFoo', None, 'qFox'),
+             ('rBar', None, 'qBar'),
+             ('rBaz', None, 'qBaz')]
+
+    def test_lookup_returns_single_queue(self):
+        result = self.e.lookup(self.table, 'eFoo', 'order-123', None)
+        assert len(result) == 1
+        assert next(iter(result)) in {'qFoo', 'qFox', 'qBar', 'qBaz'}
+
+    def test_same_routing_key_always_same_queue(self):
+        first = self.e.lookup(self.table, 'eFoo', 'order-123', None)
+        for _ in range(100):
+            assert self.e.lookup(
+                self.table, 'eFoo', 'order-123', None) == first
+
+    def test_routing_is_stable_regardless_of_binding_order(self):
+        reversed_table = list(reversed(self.table))
+        for key in ('order-1', 'order-2', 'order-3'):
+            assert self.e.lookup(self.table, 'eFoo', key, None) == \
+                self.e.lookup(reversed_table, 'eFoo', key, None)
+
+    def test_distributes_keys_across_all_queues(self):
+        selected = {
+            next(iter(self.e.lookup(
+                self.table, 'eFoo', f'order-{i}', None)))
+            for i in range(200)
+        }
+        assert selected == {'qFoo', 'qFox', 'qBar', 'qBaz'}
+
+    def test_lookup_without_bindings(self):
+        assert self.e.lookup([], 'eFoo', 'order-1', 'DEFAULT') == {'DEFAULT'}
+        assert self.e.lookup([], 'eFoo', 'order-1', None) == set()
+
+    def test_duplicate_bindings_counted_once(self):
+        duplicated = self.table + self.table
+        result = self.e.lookup(duplicated, 'eFoo', 'order-1', None)
+        assert len(result) == 1
+
+    def test_deliver(self):
+        self.e.channel = Mock()
+        self.e.channel._lookup.return_value = ['qFoo']
+        message = Mock()
+        self.e.deliver(message, 'exchange', 'order-1')
+        self.e.channel._put.assert_called_once_with(
+            'qFoo', message,
+        )
+
+
 class test_Topic(ExchangeCase):
     type = exchange.TopicExchange
     table = [
